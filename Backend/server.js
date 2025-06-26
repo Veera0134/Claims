@@ -10,20 +10,21 @@ const port = 3031;
 // Middleware
 app.use(cors());
 app.use(express.json());
+// Update this line to ensure proper path resolution
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 // Configure multer for file uploads
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
     const uploadDir = path.join(__dirname, 'uploads');
     if (!fs.existsSync(uploadDir)) {
-      fs.mkdirSync(uploadDir);
+      fs.mkdirSync(uploadDir, { recursive: true });
     }
     cb(null, uploadDir);
   },
   filename: (req, file, cb) => {
     const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
     const ext = path.extname(file.originalname);
-    cb(null, uniqueSuffix + ext); // Store with simple filename
+    cb(null, uniqueSuffix + ext);
   }
 });
 
@@ -32,14 +33,16 @@ const upload = multer({
   limits: { fileSize: 5 * 1024 * 1024 } // 5MB limit
 });
 
-// PostgreSQL connection
-const pool = new Pool({
+// PostgreSQL connection configuration
+const dbConfig = {
   user: 'postgres',
   host: 'postgres',
   database: 'claims_portal',
   password: 'admin123',
   port: 5432,
-});
+};
+
+const pool = new Pool(dbConfig);
 
 // Initialize database table
 async function initializeDatabase() {
@@ -84,7 +87,16 @@ async function initializeDatabase() {
     }
   } catch (err) {
     console.error('Error initializing database:', err);
+    process.exit(1); // Exit if database initialization fails
   }
+}
+
+// Helper function to construct file URLs
+function getFileUrl(filename) {
+  const baseUrl = process.env.NODE_ENV === 'production' 
+    ? 'https://your-production-domain.com' 
+    : `http://13.232.23.97:${port}`;
+  return `${baseUrl}/uploads/${encodeURIComponent(filename)}`;
 }
 
 // Get all claims
@@ -92,24 +104,25 @@ app.get('/api/claims', async (req, res) => {
   try {
     const { rows: claims } = await pool.query('SELECT * FROM claims ORDER BY date DESC');
     
-    // Get attachments for each claim
     for (const claim of claims) {
       const { rows: attachments } = await pool.query(
         'SELECT file_name, file_path, file_size FROM claim_attachments WHERE claim_id = $1',
         [claim.id]
       );
-// When retrieving files, construct the URL properly
-claim.attachments = attachments.map(att => ({
-  name: att.file_name,
-  url: `http://13.232.23.97:3031/uploads/${encodeURIComponent(att.file_path)}`,
-  size: att.file_size
-}));
+      claim.attachments = attachments.map(att => ({
+        name: att.file_name,
+        url: getFileUrl(att.file_path),
+        size: att.file_size
+      }));
     }
     
     res.json(claims);
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'Internal server error' });
+    res.status(500).json({ 
+      error: 'Internal server error',
+      message: err.message
+    });
   }
 });
 
@@ -130,14 +143,17 @@ app.get('/api/claims/:id', async (req, res) => {
     
     claim.attachments = attachments.map(att => ({
       name: att.file_name,
-      url: `http://13.232.23.97:3031/${att.file_path}`,
+      url: getFileUrl(att.file_path),
       size: att.file_size
     }));
     
     res.json(claim);
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'Internal server error' });
+    res.status(500).json({ 
+      error: 'Internal server error',
+      message: err.message
+    });
   }
 });
 
@@ -148,9 +164,11 @@ app.get('/api/claims/employee/:employeeId', async (req, res) => {
     return res.status(400).json({ error: 'Invalid Employee ID format' });
   }
   try {
-    const { rows: claims } = await pool.query('SELECT * FROM claims WHERE employee_id = $1 ORDER BY date DESC', [employeeId]);
+    const { rows: claims } = await pool.query(
+      'SELECT * FROM claims WHERE employee_id = $1 ORDER BY date DESC', 
+      [employeeId]
+    );
     
-    // Get attachments for each claim
     for (const claim of claims) {
       const { rows: attachments } = await pool.query(
         'SELECT file_name, file_path, file_size FROM claim_attachments WHERE claim_id = $1',
@@ -158,7 +176,7 @@ app.get('/api/claims/employee/:employeeId', async (req, res) => {
       );
       claim.attachments = attachments.map(att => ({
         name: att.file_name,
-        url: `http://13.232.23.97:3031/${att.file_path}`,
+        url: getFileUrl(att.file_path),
         size: att.file_size
       }));
     }
@@ -166,22 +184,35 @@ app.get('/api/claims/employee/:employeeId', async (req, res) => {
     res.json(claims);
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'Internal server error' });
+    res.status(500).json({ 
+      error: 'Internal server error',
+      message: err.message
+    });
   }
 });
 
 // Add a new claim with file uploads
 app.post('/api/claims', upload.array('attachments'), async (req, res) => {
-  const { employeeId, employeeName, title, amount, category, description } = req.body;
-  
   // Validate required fields
-  if (!employeeId || !employeeName || !title || !amount || !category || !description) {
-    return res.status(400).json({ error: 'All fields are required' });
+  const requiredFields = ['employeeId', 'employeeName', 'title', 'amount', 'category', 'description'];
+  const missingFields = requiredFields.filter(field => !req.body[field]);
+  
+  if (missingFields.length > 0) {
+    return res.status(400).json({ 
+      error: 'Missing required fields',
+      missing: missingFields
+    });
   }
 
+  const { employeeId, employeeName, title, amount, category, description } = req.body;
   const date = new Date().toISOString().split('T')[0];
 
   try {
+    // Validate employee ID format
+    if (!/^ATS0(?!000)\d{3}$/.test(employeeId)) {
+      return res.status(400).json({ error: 'Invalid Employee ID format' });
+    }
+
     // Check for existing claims
     const { rows: existing } = await pool.query(
       'SELECT * FROM claims WHERE employee_id = $1 AND date = $2',
@@ -226,7 +257,7 @@ app.post('/api/claims', upload.array('attachments'), async (req, res) => {
 
     claim.attachments = attachments.map(att => ({
       name: att.file_name,
-      url: `http://13.232.23.97:3031/${path.basename(att.file_path)}`,
+      url: getFileUrl(att.file_path),
       size: att.file_size
     }));
 
@@ -247,8 +278,7 @@ app.post('/api/claims', upload.array('attachments'), async (req, res) => {
 
     res.status(500).json({ 
       error: 'Internal server error',
-      details: err.message,
-      stack: process.env.NODE_ENV === 'development' ? err.stack : undefined
+      message: err.message
     });
   }
 });
@@ -257,6 +287,10 @@ app.post('/api/claims', upload.array('attachments'), async (req, res) => {
 app.put('/api/claims/:id', async (req, res) => {
   const { id } = req.params;
   const { status, response } = req.body;
+
+  if (!status || !['pending', 'approved', 'rejected'].includes(status)) {
+    return res.status(400).json({ error: 'Invalid status value' });
+  }
 
   try {
     const { rows } = await pool.query(
@@ -269,16 +303,31 @@ app.put('/api/claims/:id', async (req, res) => {
     res.json(rows[0]);
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'Internal server error' });
+    res.status(500).json({ 
+      error: 'Internal server error',
+      message: err.message
+    });
   }
+});
+
+// Error handling middleware
+app.use((err, req, res, next) => {
+  console.error('Unhandled error:', err);
+  res.status(500).json({
+    error: 'Internal Server Error',
+    message: err.message
+  });
 });
 
 // Start server
 app.listen(port, async () => {
-  await initializeDatabase();
-  console.log(`Server running on http://13.232.23.97:${port}`);
+  try {
+    await initializeDatabase();
+    console.log(`Server running on http://13.232.23.97:${port}`);
+  } catch (err) {
+    console.error('Failed to start server:', err);
+    process.exit(1);
+  }
 });
-
-
 
 
